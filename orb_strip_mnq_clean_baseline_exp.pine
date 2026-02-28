@@ -1,0 +1,344 @@
+//@version=6
+strategy("ORB MNQ Env+Bias Playbook (1m Anchored)",
+     overlay = true,
+     initial_capital = 50000,
+     pyramiding = 0,
+     process_orders_on_close = true,
+     calc_on_every_tick = false,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 1.2,
+     slippage = 2)
+
+// Core
+int qty = input.int(1, "Contracts", minval=1)
+int maxTradesDay = input.int(1, "Max Trades / Day", minval=0)
+bool enableTrading = input.bool(true, "Enable Strategy Entries")
+
+// Prop risk guardrails
+float dailyLossLimit = input.float(500.0, "Daily Loss Limit ($)", step=50.0)
+float dailyProfitTarget = input.float(1000.0, "Daily Profit Target ($)", step=50.0)
+
+// Sessions
+string tz = "America/New_York"
+string onBuildSess = input.session("1600-0929", "Overnight Build")
+string orSess = input.session("0930-0945", "OR Window")
+string entrySess = input.session("0945-1145", "Entry Window")
+string flatSess = input.session("1230-1231", "Force Flat")
+string rthSess = input.session("0930-1600", "RTH")
+
+// Structure / execution
+int acceptBars = input.int(2, "Acceptance Bars", minval=1)
+float rrTarget = input.float(1.85, "Target RR", step=0.05)
+float stopFracFade = input.float(0.20, "Fade Stop Buffer (OR frac)", step=0.05, minval=0.05)
+float stopFracCont = input.float(0.20, "Continuation Stop Buffer (OR frac)", step=0.05, minval=0.05)
+int lookbackDays = input.int(252, "OR% Percentile Lookback", minval=30)
+
+// Visuals
+bool showLines = input.bool(true, "Show Levels")
+bool showORBox = input.bool(true, "Show OR Box")
+bool showHUD = input.bool(true, "Show Decision HUD")
+bool strictQuality = input.bool(true, "Use Strict Quality Filter")
+
+f_inSession(string sess) =>
+    not na(time("1", sess, tz))
+
+f_loc3(float x, float hi, float lo) =>
+    int id = -1
+    if not na(x) and not na(hi) and not na(lo)
+        if x > hi
+            id := 2
+        else if x < lo
+            id := 0
+        else
+            id := 1
+    id
+
+f_envTxt(int id) => id == 0 ? "ROT" : id == 1 ? "BAL" : id == 2 ? "EXP" : "NA"
+f_onTxt(float onrPct) => na(onrPct) ? "NA" : onrPct < 0.25 ? "COMP" : onrPct < 0.50 ? "NORMAL" : "EXP"
+
+f_engine() =>
+    bool inONBuild = f_inSession(onBuildSess)
+    bool inOR = f_inSession(orSess)
+    bool inEntry = f_inSession(entrySess)
+    bool inFlat = f_inSession(flatSess)
+    bool inRTH = f_inSession(rthSess)
+
+    int dayKey = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+    var int prevDayKey = int(na)
+    bool newDay = false
+    if na(prevDayKey)
+        prevDayKey := dayKey
+        newDay := true
+    else if dayKey != prevDayKey
+        prevDayKey := dayKey
+        newDay := true
+
+    // Previous-day anchors (deterministic carry)
+    var float curRthH = float(na)
+    var float curRthL = float(na)
+    var float pdh = float(na)
+    var float pdl = float(na)
+    var float pdc = float(na)
+    var float yRthRange = float(na)
+
+    if newDay
+        pdc := close[1]
+        if not na(curRthH) and not na(curRthL)
+            pdh := curRthH
+            pdl := curRthL
+            float rrPrev = curRthH - curRthL
+            if rrPrev > syminfo.mintick
+                yRthRange := rrPrev
+        curRthH := na
+        curRthL := na
+
+    if inRTH
+        curRthH := na(curRthH) ? high : math.max(curRthH, high)
+        curRthL := na(curRthL) ? low : math.min(curRthL, low)
+
+    // Overnight freeze at 09:30
+    var float onH = float(na)
+    var float onL = float(na)
+    if newDay
+        onH := na
+        onL := na
+    if inONBuild
+        onH := na(onH) ? high : math.max(onH, high)
+        onL := na(onL) ? low : math.min(onL, low)
+
+    // OR build
+    var float orH = float(na)
+    var float orL = float(na)
+    var float orClose = float(na)
+    var bool orComplete = false
+    var bool wasInOR = false
+    var int orStartT = int(na)
+
+    if newDay
+        orH := na
+        orL := na
+        orClose := na
+        orComplete := false
+        wasInOR := false
+        orStartT := na
+
+    if inOR and not wasInOR
+        wasInOR := true
+        orStartT := time
+        orH := high
+        orL := low
+    if inOR
+        orH := na(orH) ? high : math.max(orH, high)
+        orL := na(orL) ? low : math.min(orL, low)
+    if not inOR and wasInOR
+        wasInOR := false
+        orComplete := true
+        orClose := close[1]
+
+    float orRange = (not na(orH) and not na(orL)) ? math.abs(orH - orL) : float(na)
+    float onRange = (not na(onH) and not na(onL)) ? math.abs(onH - onL) : float(na)
+    float orPct = (not na(yRthRange) and yRthRange > syminfo.mintick and not na(orRange)) ? orRange / yRthRange : float(na)
+    float onrPct = (not na(yRthRange) and yRthRange > syminfo.mintick and not na(onRange)) ? onRange / yRthRange : float(na)
+    bool ready = orComplete and not na(orRange) and orRange > syminfo.mintick and not na(yRthRange)
+
+    // First break + acceptance state
+    var int firstBreak = 0
+    var bool accepted = false
+    var bool rejected = false
+    var bool reclaimInside = false
+    var int holdCount = 0
+
+    if newDay
+        firstBreak := 0
+        accepted := false
+        rejected := false
+        reclaimInside := false
+        holdCount := 0
+
+    if ready and inEntry
+        if firstBreak == 0
+            if close > orH
+                firstBreak := 1
+                holdCount := 1
+            else if close < orL
+                firstBreak := -1
+                holdCount := 1
+        else
+            if firstBreak == 1
+                holdCount := close > orH ? holdCount + 1 : 0
+                if close < orH
+                    rejected := true
+                    reclaimInside := close > orL
+            else
+                holdCount := close < orL ? holdCount + 1 : 0
+                if close > orL
+                    rejected := true
+                    reclaimInside := close < orH
+            if holdCount >= acceptBars
+                accepted := true
+
+    // Continuation retest signals
+    bool contLong = ready and inEntry and firstBreak == 1 and accepted and low <= orH and close > orH
+    bool contShort = ready and inEntry and firstBreak == -1 and accepted and high >= orL and close < orL
+
+    // Trap fade signals
+    bool fadeShort = ready and inEntry and firstBreak == 1 and rejected and reclaimInside
+    bool fadeLong = ready and inEntry and firstBreak == -1 and rejected and reclaimInside
+
+    int yy = year(time, tz)
+    int mm = month(time, tz)
+    int dd = dayofmonth(time, tz)
+    int boxEndT = timestamp(tz, yy, mm, dd, 12, 30)
+
+    [dayKey, inEntry, inFlat, ready, orH, orL, orClose, orPct, onrPct, pdh, pdl, pdc, onH, onL, firstBreak, accepted, rejected, contLong, contShort, fadeLong, fadeShort, orStartT, boxEndT]
+
+[dayKey1m, inEntry1m, inFlat1m, ready1m, orH, orL, orClose1m, orPct1m, onrPct1m, pdh, pdl, pdc, onH, onL, firstBreak1m, accepted1m, rejected1m, contLong1m, contShort1m, fadeLong1m, fadeShort1m, orStartT1m, boxEndT1m] = request.security(syminfo.tickerid, "1", f_engine(), barmerge.gaps_off, barmerge.lookahead_off)
+
+float orRangeNow = (not na(orH) and not na(orL)) ? math.abs(orH - orL) : float(na)
+
+// Environment bucketing by OR% percentiles
+var arrOrPct = array.new_float()
+var int histDay = int(na)
+if na(histDay)
+    histDay := dayKey1m
+if dayKey1m != histDay
+    if not na(orPct1m[1])
+        array.push(arrOrPct, orPct1m[1])
+        if array.size(arrOrPct) > lookbackDays
+            array.shift(arrOrPct)
+    histDay := dayKey1m
+
+f_percentile(array<float> a, float p) =>
+    float v = float(na)
+    int n = array.size(a)
+    if n > 0
+        array<float> b = array.copy(a)
+        array.sort(b, order.ascending)
+        int idx = int(math.floor((n - 1) * p))
+        idx := math.max(0, math.min(n - 1, idx))
+        v := array.get(b, idx)
+    v
+
+float p33 = f_percentile(arrOrPct, 0.33)
+float p66 = f_percentile(arrOrPct, 0.66)
+int envBucket = -1
+if not na(orPct1m)
+    if na(p33) or na(p66)
+        envBucket := orPct1m < 0.18 ? 0 : orPct1m < 0.35 ? 1 : 2
+    else
+        envBucket := orPct1m < p33 ? 0 : orPct1m < p66 ? 1 : 2
+
+int pdrLoc = f_loc3(orClose1m, pdh, pdl)
+int onrLoc = f_loc3(orClose1m, onH, onL)
+int biasDir = pdrLoc == 2 and onrLoc == 2 ? 1 : pdrLoc == 0 and onrLoc == 0 ? -1 : 0
+string bias = biasDir == 1 ? "STRONG BULL" : biasDir == -1 ? "STRONG BEAR" : (pdrLoc == 1 and onrLoc == 1 ? "NEUTRAL" : "MIXED")
+
+// Playbook by setup family
+bool useFade = envBucket == 0 or envBucket == 1
+bool useCont = envBucket == 2
+bool onCompressed = f_onTxt(onrPct1m) == "COMP"
+
+bool fadeLongOk = fadeLong1m and (not strictQuality or biasDir == 1)
+bool fadeShortOk = fadeShort1m and (not strictQuality or biasDir == -1)
+bool contLongOk = contLong1m and (not strictQuality or (biasDir == 1 and not onCompressed))
+bool contShortOk = contShort1m and (not strictQuality or (biasDir == -1 and not onCompressed))
+
+bool longSetup = (useFade and fadeLongOk) or (useCont and contLongOk)
+bool shortSetup = (useFade and fadeShortOk) or (useCont and contShortOk)
+string setupName = useFade ? "ROT/BAL TRAP FADE" : useCont ? "EXP DISPLACEMENT CONT" : "NO SETUP"
+
+// Daily risk locks
+var int tradesToday = 0
+var int dayRef = int(na)
+if na(dayRef)
+    dayRef := dayKey1m
+if dayKey1m != dayRef
+    dayRef := dayKey1m
+    tradesToday := 0
+
+var float prevPos = float(na)
+if na(prevPos)
+    prevPos := strategy.position_size
+else
+    if prevPos == 0 and strategy.position_size != 0
+        tradesToday += 1
+    prevPos := strategy.position_size
+
+var float dayStartNet = float(na)
+var int pnlDayKey = int(na)
+if na(pnlDayKey) or dayKey1m != pnlDayKey
+    pnlDayKey := dayKey1m
+    dayStartNet := strategy.netprofit
+float dayPnl = strategy.netprofit - dayStartNet
+bool dayLossHit = dayPnl <= -dailyLossLimit
+bool dayProfitHit = dayPnl >= dailyProfitTarget
+bool dayLocked = dayLossHit or dayProfitHit
+
+string actionLine = not ready1m ? "WAIT: OR NOT BUILT" : dayLocked ? "STOP: DAY LIMIT HIT" : longSetup ? "ACTION: GO LONG" : shortSetup ? "ACTION: GO SHORT" : useFade ? "WAIT: NEED FAIL + RECLAIM" : useCont ? "WAIT: NEED ACCEPT + RETEST" : "NO TRADE"
+
+bool capOk = maxTradesDay == 0 or tradesToday < maxTradesDay
+bool allow = enableTrading and ready1m and capOk and not inFlat1m and not dayLocked
+
+if dayLocked and strategy.position_size != 0
+    strategy.close_all(comment = dayLossHit ? "DayLossLock" : "DayProfitLock")
+
+// Entry + RR exits
+if allow and longSetup and strategy.position_size <= 0 and not na(orRangeNow)
+    float stopL = useFade ? (orL - orRangeNow * stopFracFade) : (orH - orRangeNow * stopFracCont)
+    float riskL = close - stopL
+    if riskL > syminfo.mintick
+        float tgtL = close + riskL * rrTarget
+        strategy.entry("L", strategy.long, qty=qty)
+        strategy.exit("L-X", from_entry="L", stop=stopL, limit=tgtL)
+
+if allow and shortSetup and strategy.position_size >= 0 and not na(orRangeNow)
+    float stopS = useFade ? (orH + orRangeNow * stopFracFade) : (orL + orRangeNow * stopFracCont)
+    float riskS = stopS - close
+    if riskS > syminfo.mintick
+        float tgtS = close - riskS * rrTarget
+        strategy.entry("S", strategy.short, qty=qty)
+        strategy.exit("S-X", from_entry="S", stop=stopS, limit=tgtS)
+
+if inFlat1m and strategy.position_size != 0
+    strategy.close_all(comment = "ForceFlat")
+
+// Visuals
+plot(showLines ? orH : na, "ORH", color=color.new(color.blue, 0), linewidth=2)
+plot(showLines ? orL : na, "ORL", color=color.new(color.blue, 0), linewidth=2)
+plot(showLines ? onH : na, "ONH", color=color.new(color.gray, 20))
+plot(showLines ? onL : na, "ONL", color=color.new(color.gray, 20))
+plot(showLines ? pdh : na, "PDH", color=color.new(color.orange, 20))
+plot(showLines ? pdl : na, "PDL", color=color.new(color.orange, 20))
+plot(showLines ? pdc : na, "PDC", color=color.new(color.purple, 30))
+
+var box orBox = na
+if showORBox and not na(orStartT1m) and not na(boxEndT1m) and not na(orH) and not na(orL)
+    if na(orBox) or ta.change(dayKey1m) != 0
+        if not na(orBox)
+            box.delete(orBox)
+        orBox := box.new(left=orStartT1m, top=orH, right=boxEndT1m, bottom=orL, xloc=xloc.bar_time, bgcolor=color.new(color.blue, 88), border_color=color.new(color.blue, 30))
+    else
+        box.set_left(orBox, orStartT1m)
+        box.set_right(orBox, boxEndT1m)
+        box.set_top(orBox, orH)
+        box.set_bottom(orBox, orL)
+
+// Decision HUD (only trade-relevant items)
+var table hud = na
+if showHUD
+    if na(hud)
+        hud := table.new(position.top_right, 2, 7)
+    table.cell(hud, 0, 0, "ENV")
+    table.cell(hud, 1, 0, f_envTxt(envBucket))
+    table.cell(hud, 0, 1, "BIAS")
+    table.cell(hud, 1, 1, bias)
+    table.cell(hud, 0, 2, "ON")
+    table.cell(hud, 1, 2, f_onTxt(onrPct1m))
+    table.cell(hud, 0, 3, "OR%")
+    table.cell(hud, 1, 3, str.tostring(orPct1m, format.mintick))
+    table.cell(hud, 0, 4, "PLAYBOOK")
+    table.cell(hud, 1, 4, setupName)
+    table.cell(hud, 0, 5, "ACTION")
+    table.cell(hud, 1, 5, actionLine)
+    table.cell(hud, 0, 6, "DAY")
+    table.cell(hud, 1, 6, dayLocked ? (dayLossHit ? "STOP -500" : "LOCK +1000") : "ACTIVE " + str.tostring(dayPnl, format.mintick))
